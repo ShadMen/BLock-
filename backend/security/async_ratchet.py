@@ -14,7 +14,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import hmac
-from typing import Tuple
+from typing import Dict, Tuple
+
+
+MAX_SKIP = 1000
 
 
 def _hmac_sha256(key: bytes, data: bytes) -> bytes:
@@ -83,6 +86,11 @@ class RatchetState:
     recv_chain_key: bytes
     send_counter: int = 0
     recv_counter: int = 0
+    skipped_message_keys: Dict[int, bytes] | None = None
+
+    def __post_init__(self) -> None:
+        if self.skipped_message_keys is None:
+            self.skipped_message_keys = {}
 
     def encrypt_message(self, plaintext: bytes) -> tuple[int, bytes, bytes]:
         """Шифрует сообщение и продвигает send-chain.
@@ -103,11 +111,25 @@ class RatchetState:
         Поддерживает асинхронность: можно догнать пропущенные индексы,
         продвигая recv-chain до нужного сообщения.
         """
-        while self.recv_counter <= message_index:
+        if message_index < 0:
+            raise ValueError("message index must be non-negative")
+
+        cached_mk = self.skipped_message_keys.pop(message_index, None)
+        if cached_mk is not None:
+            return xor_stream_encrypt(cached_mk, ciphertext, nonce)
+
+        if message_index < self.recv_counter:
+            raise ValueError("message index already processed")
+
+        if message_index - self.recv_counter > MAX_SKIP:
+            raise ValueError("message index too far in future")
+
+        while self.recv_counter < message_index:
             self.recv_chain_key, mk = kdf_chain(self.recv_chain_key)
-            if self.recv_counter == message_index:
-                plaintext = xor_stream_encrypt(mk, ciphertext, nonce)
-                self.recv_counter += 1
-                return plaintext
+            self.skipped_message_keys[self.recv_counter] = mk
             self.recv_counter += 1
-        raise ValueError("message index already processed")
+
+        self.recv_chain_key, mk = kdf_chain(self.recv_chain_key)
+        plaintext = xor_stream_encrypt(mk, ciphertext, nonce)
+        self.recv_counter += 1
+        return plaintext
